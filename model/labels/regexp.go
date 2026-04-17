@@ -149,7 +149,7 @@ func (m *FastRegexMatcher) IsOptimized() bool {
 
 // findSetMatches extract equality matches from a regexp.
 // Returns nil if we can't replace the regexp by only equality matchers or the regexp contains
-// a mix of case sensitive and case insensitive matchers.
+// a mix of case-sensitive and case-insensitive matchers.
 func findSetMatches(re *syntax.Regexp) (matches []string, caseSensitive bool) {
 	clearBeginEndText(re)
 
@@ -189,7 +189,7 @@ func findSetMatchesInternal(re *syntax.Regexp, base string) (matches []string, c
 			totalSet += int(re.Rune[i+1]-re.Rune[i]) + 1
 		}
 		// limits the total characters that can be used to create matches.
-		// In some case like negation [^0-9] a lot of possibilities exists and that
+		// In some case like negation [^0-9] a lot of possibilities exist and that
 		// can create thousands of possible matches at which points we're better off using regexp.
 		if totalSet > maxSetMatches {
 			return nil, false
@@ -392,13 +392,23 @@ func optimizeAlternatingSimpleContains(r *syntax.Regexp) *syntax.Regexp {
 		return r
 	}
 	containsLiterals := make([]*syntax.Regexp, 0, len(r.Sub))
-	for _, sub := range r.Sub {
+	// true if all literals are case-sensitive, false if all literals are case-insensitive,
+	// return early if we see mixed case-sensitivity across literals
+	var literalsCaseSensitive bool
+	for i, sub := range r.Sub {
 		// If any subexpression does not take the form .*literal.*, we should not try to optimize this
 		if sub.Op != syntax.OpConcat || len(sub.Sub) != 3 {
 			return r
 		}
 		concatSubs := sub.Sub
-		if !isCaseSensitiveLiteral(concatSubs[1]) || !isMatchAny(concatSubs[0]) || !isMatchAny(concatSubs[2]) {
+		if concatSubs[1].Op != syntax.OpLiteral || !isMatchAny(concatSubs[0]) || !isMatchAny(concatSubs[2]) {
+			return r
+		}
+		// Set literalsCaseSensitive for the first alternate
+		if i == 0 {
+			literalsCaseSensitive = isCaseSensitive(concatSubs[1])
+		}
+		if isCaseSensitive(concatSubs[1]) != literalsCaseSensitive {
 			return r
 		}
 		containsLiterals = append(containsLiterals, concatSubs[1])
@@ -416,6 +426,10 @@ func optimizeAlternatingSimpleContains(r *syntax.Regexp) *syntax.Regexp {
 			alts,
 			suffixAnyMatcher,
 		}
+		if !literalsCaseSensitive {
+			returnRegex.Flags |= syntax.FoldCase
+		}
+
 		return returnRegex
 	}
 	return r
@@ -621,10 +635,18 @@ func stringMatcherFromRegexpInternal(re *syntax.Regexp) StringMatcher {
 			}
 
 		// We found literals in the middle. We can trigger the fast path only if
-		// the matches are case sensitive because containsStringMatcher doesn't
-		// support case insensitive.
+		// the matches are case-sensitive because containsStringMatcher doesn't
+		// support case-insensitive.
 		case matchesCaseSensitive:
 			return &containsStringMatcher{
+				substrings: matches,
+				left:       left,
+				right:      right,
+			}
+		// If we hit this point, we have non-empty literals in the middle, but they are not case-sensitive;
+		// we use a case-insensitive contains matcher for these.
+		default:
+			return &containsCaseInsensitiveStringMatcher{
 				substrings: matches,
 				left:       left,
 				right:      right,
@@ -715,6 +737,58 @@ func (m *containsStringMatcher) Matches(s string) bool {
 			}
 		case m.right != nil:
 			if strings.HasPrefix(s, substr) && m.right.Matches(s[len(substr):]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// containsCaseInsensitiveStringMatcher is similar to containsStringMatcher,
+// except it matches a string if it contains a case-insensitive match of any substrings.
+// The same behaviors for left and right in containsStringMatcher apply here.
+type containsCaseInsensitiveStringMatcher struct {
+	// The matcher that must match the left side. Can be nil.
+	left StringMatcher
+
+	// At least one of these strings must match in the "middle", between left and right matchers.
+	substrings []string
+
+	// The matcher that must match the right side. Can be nil.
+	right StringMatcher
+}
+
+func (m *containsCaseInsensitiveStringMatcher) Matches(s string) bool {
+	for _, substr := range m.substrings {
+		switch {
+		case m.right != nil && m.left != nil:
+			pos := 0
+
+			// If pos advances to within len(substr) of the end of the string, we know we won't find substr
+			for pos <= len(s)-len(substr) {
+				if !strings.EqualFold(s[pos:pos+1], substr[0:1]) {
+					// If not a match for the substring, continue looking
+					pos++
+					continue
+				}
+				// If we get here, we found a match for the first character of a substring;
+				// check against the substr length
+				if strings.EqualFold(s[pos:pos+len(substr)], substr) {
+
+					// Check to see if left and right match; if yes, return true. If no, continue
+					if m.left.Matches(s[:pos]) && m.right.Matches(s[pos+len(substr):]) {
+						return true
+					}
+				}
+				pos++
+			}
+		case m.left != nil:
+			// If we have to check for characters on the left then we need to match a suffix.
+			if hasSuffixCaseInsensitive(s, substr) && m.left.Matches(s[:len(s)-len(substr)]) {
+				return true
+			}
+		case m.right != nil:
+			if hasPrefixCaseInsensitive(s, substr) && m.right.Matches(s[len(substr):]) {
 				return true
 			}
 		}
